@@ -1,14 +1,18 @@
 import io
 import random
 import picamera
-from PIL import Image
 import numpy as np
 import picamera.array
 import argparse
 import logging
 import sys
+import signal
+import zmq
+from zmq.eventloop import zmqstream
 
-logger = logging.getLogger('catcierge-web')
+logger = logging.getLogger('catcierge-cam')
+level = logging.getLevelName('INFO')
+logger.setLevel(level)
 
 class DetectMotion(picamera.array.PiMotionAnalysis):
     def __init__(self):
@@ -31,7 +35,8 @@ running = True;
 sigint_count = 0
 
 def sighandler(signum, frame):
-    logger.info("Program: Received SIGINT, shutting down...")
+    global sigint_count
+    print("Program: Received SIGINT, shutting down...")
 
     if sigint_count > 1:
         sys.exit(0)
@@ -61,13 +66,13 @@ class CatciergeCam:
         if not hasattr(self, "zmq_ctx"):
             self.zmq_ctx = zmq.Context()
             self.zmq_sock = self.zmq_ctx.socket(zmq.SUB)
-            self.zmq_stream = zmqstream.ZMQStream(self.zmq_sock, tornado.ioloop.IOLoop.instance())
+            self.zmq_stream = zmqstream.ZMQStream(self.zmq_sock)
             self.zmq_stream.on_recv(self.zmq_on_recv)
             self.zmq_sock.setsockopt(zmq.SUBSCRIBE, b"")
 
             connect_str = "%s://%s:%d" % (self.args.transport, self.args.server, self.args.port)
 
-            logger.info("Connecting ZMQ socket: %s" % connect_str)
+            print("Connecting ZMQ socket: %s" % connect_str)
             self.zmq_sock.connect(connect_str)
 
     def zmq_on_recv(self, msg):
@@ -78,11 +83,11 @@ class CatciergeCam:
         req_topic = msg[0]
 
         if (req_topic == self.args.topic):
-            logger.info('Catcierge topic %s: Trigger cam' % req_topic)
+            print('Catcierge topic %s: Trigger cam' % req_topic)
             self.cam_triggered = True
             self.catcierge_id = msg["id"]
         else:
-            logger.info("Catcierge topic %s: Not listening to topic" % req_topic)
+            print("Catcierge topic %s: Not listening to topic" % req_topic)
 
     def write_video(self, stream):
         # Write the entire content of the circular buffer to disk. No need to
@@ -142,22 +147,22 @@ class CatciergeCam:
 def main():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--width", "-w", nargs="1", default=1280
+    parser.add_argument("--width", "-w", type=int, default=1280,
         help="Camera resolution width.")
-    parser.add_argument("--height", "-h", nargs="1", default=720
+    parser.add_argument("--height", type=int, default=720,
         help="Camera resolution height.")
-    parser.add_argument("--buffer", "-b", nargs="1", default=10
+    parser.add_argument("--buffer", "-b", type=int, default=10,
         help="""Circular buffer duration in seconds.
                 Time to record before being triggered.""")
-    parser.add_argument("--server", "-s", nargs="1",
+    parser.add_argument("--server", "-s", required=True,
         help="Catcierge ZMQ publish server hostname.")
-    parser.add_argument("--port", "-p", nargs="1", default=5556
+    parser.add_argument("--port", "-p", type=int, default=5556,
         help="Catcierge ZMQ publish server port.")
-    parser.add_argument("--transport", "-t", nargs="1", default="tcp")
+    parser.add_argument("--transport", "-t", default="tcp",
         help="Catcierge ZMQ publish server transport.")
-    parser.add_argument("--topic", nargs="1", default=""
+    parser.add_argument("--topic", default="",
         help="Catcierge ZMQ publish topic to listen to.")
-    parser.add_argument("--max_duration", nargs="1", default=60
+    parser.add_argument("--max_duration", type=int, default=60,
         help="Max duration in seconds to record after triggered.")
 
     args = parser.parse_args()
