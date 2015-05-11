@@ -8,6 +8,7 @@ import logging
 import sys
 import signal
 import zmq
+import json
 from zmq.eventloop import zmqstream
 
 logger = logging.getLogger('catcierge-cam')
@@ -15,7 +16,8 @@ level = logging.getLevelName('INFO')
 logger.setLevel(level)
 
 class DetectMotion(picamera.array.PiMotionAnalysis):
-    def __init__(self):
+    def __init__(self, *args, **kwargs):
+        super(DetectMotion, self).__init__(*args, **kwargs)
         self.motion = False
 
     def analyse(self, a):
@@ -66,26 +68,27 @@ class CatciergeCam:
         if not hasattr(self, "zmq_ctx"):
             self.zmq_ctx = zmq.Context()
             self.zmq_sock = self.zmq_ctx.socket(zmq.SUB)
-            self.zmq_stream = zmqstream.ZMQStream(self.zmq_sock)
-            self.zmq_stream.on_recv(self.zmq_on_recv)
             self.zmq_sock.setsockopt(zmq.SUBSCRIBE, b"")
+
+            self.zpoll = zmq.Poller()
+            self.zpoll.register(self.zmq_sock, zmq.POLLIN)
 
             connect_str = "%s://%s:%d" % (self.args.transport, self.args.server, self.args.port)
 
             print("Connecting ZMQ socket: %s" % connect_str)
             self.zmq_sock.connect(connect_str)
 
-    def zmq_on_recv(self, msg):
+    def zmq_on_recv(self, req_topic, msg):
         """
         Receives ZMQ subscription messages from Catcierge and
         passes them on to the Websocket connection.
         """
-        req_topic = msg[0]
+        #req_topic = msg[0]
 
         if (req_topic == self.args.topic):
-            print('Catcierge topic %s: Trigger cam' % req_topic)
             self.cam_triggered = True
-            self.catcierge_id = msg["id"]
+            self.catcierge_id = json.loads(msg)["id"]
+            print('Catcierge topic %s, id: %s: Trigger cam' % (req_topic, self.catcierge_id[6:]))
         else:
             print("Catcierge topic %s: Not listening to topic" % req_topic)
 
@@ -93,7 +96,7 @@ class CatciergeCam:
         # Write the entire content of the circular buffer to disk. No need to
         # lock the stream here as we're definitely not writing to it
         # simultaneously
-        with io.open('catcierge-%s-01.h264', 'wb') as output:
+        with io.open('catcierge-%s-01.h264' % (self.catcierge_id), 'wb') as output:
             for frame in stream.frames:
                 if frame.frame_type == picamera.PiVideoFrameType.sps_header:
                     stream.seek(frame.position)
@@ -121,9 +124,9 @@ class CatciergeCam:
                 while running:
                     camera.wait_recording(1)
 
-                    #if detect_motion(camera):
                     if self.cam_triggered:
                         self.cam_triggered = False
+                        print("Camera triggered")
 
                         # As soon as we detect motion, split the recording to
                         # record the frames "after" motion
@@ -138,9 +141,17 @@ class CatciergeCam:
                             # Wait until motion is no longer detected, then split
                             # recording back to the in-memory circular buffer
                             while output.motion:
+                                print("Recording ...")
                                 camera.wait_recording(1)
 
                         camera.split_recording(stream)
+
+                    # Check for catcierge trigger on ZMQ sub socket.
+                    socks = dict(self.zpoll.poll())
+
+                    if (self.zmq_sock in socks) and (socks[self.zmq_sock] == zmq.POLLIN):
+                        topic, msg = self.zmq_sock.recv_multipart()
+                        self.zmq_on_recv(topic, msg)
             finally:
                 camera.stop_recording()
 
