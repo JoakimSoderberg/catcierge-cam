@@ -54,7 +54,7 @@ signal.signal(signal.SIGINT, sighandler)
 signal.signal(signal.SIGTERM, sighandler)
 
 
-class CatciergeCam:
+class CatciergeCam(object):
 
     def __init__(self, args):
         self.args = args
