@@ -9,6 +9,7 @@ import sys
 import signal
 import zmq
 import json
+import time
 from zmq.eventloop import zmqstream
 
 logger = logging.getLogger('catcierge-cam')
@@ -19,21 +20,31 @@ class DetectMotion(picamera.array.PiMotionAnalysis):
     def __init__(self, *args, **kwargs):
         super(DetectMotion, self).__init__(*args, **kwargs)
         self.motion = False
+        self.motion_timeout = None
 
     def analyse(self, a):
+        if self.motion_timeout and (time.time() - self.motion_timeout) > 2:
+            self.motion_timeout = None
+
+        if self.motion_timeout:
+            return
+
         a = np.sqrt(
             np.square(a['x'].astype(np.float)) +
             np.square(a['y'].astype(np.float))
             ).clip(0, 255).astype(np.uint8)
+
         # If there're more than 10 vectors with a magnitude greater
         # than 60, then say we've detected motion
-        if (a > 60).sum() > 10:
+        if (a > 60).sum() > 5:
+            print("  Motion")
             self.motion = True
+            self.motion_timeout = time.time()
         else:
             self.motion = False
 
 sigint_handlers = []
-running = True;
+running = True
 sigint_count = 0
 
 def sighandler(signum, frame):
@@ -115,22 +126,21 @@ class CatciergeCam(object):
         global running
 
         with picamera.PiCamera() as camera:
-            camera.start_preview()
-            camera.resolution = (self.args.width, self.args.height)
-            stream = picamera.PiCameraCircularIO(camera, seconds=self.args.buffer)
-            camera.start_recording(stream, format='h264')
+            with DetectMotion(camera) as output:
+                camera.start_preview()
+                camera.resolution = (self.args.width, self.args.height)
+                stream = picamera.PiCameraCircularIO(camera, seconds=self.args.buffer)
+                camera.start_recording(stream, format='h264', motion_output=output)
 
-            try:
-                while running:
-                    camera.wait_recording(1)
+                try:
+                    while running:
+                        camera.wait_recording(1)
+                        if self.cam_triggered:
+                            self.cam_triggered = False
+                            print("  Camera triggered")
 
-                    if self.cam_triggered:
-                        self.cam_triggered = False
-                        print("Camera triggered")
-
-                        # As soon as we detect motion, split the recording to
-                        # record the frames "after" motion
-                        with DetectMotion(camera) as output:
+                            # As soon as we detect motion, split the recording to
+                            # record the frames "after" motion
                             camera.split_recording(
                                 "catcierge-%s-02.h264" % self.catcierge_id,
                                 motion_output=output)
@@ -138,24 +148,34 @@ class CatciergeCam(object):
                             # Write the 10 seconds "before" motion to disk as well
                             self.write_video(stream)
 
+                            # TODO: Timeout the recording after self.args.max_duration
+                            # TODO: Keep recording a while even after no motion.
+
                             # Wait until motion is no longer detected, then split
                             # recording back to the in-memory circular buffer
+                            camera.wait_recording(1)
                             while output.motion:
-                                print("Recording ...")
+                                print("  Recording ...")
+                                # TODO:
                                 camera.wait_recording(1)
 
-                        camera.split_recording(stream)
+                            print("  Camera stopped")
+                            camera.split_recording(stream)
 
-                    # Check for catcierge trigger on ZMQ sub socket.
-                    socks = dict(self.zpoll.poll())
+                        # Check for catcierge trigger on ZMQ sub socket.
+                        socks = dict(self.zpoll.poll())
 
-                    if (self.zmq_sock in socks) and (socks[self.zmq_sock] == zmq.POLLIN):
-                        topic, msg = self.zmq_sock.recv_multipart()
-                        self.zmq_on_recv(topic, msg)
-            finally:
-                camera.stop_recording()
+                        if (self.zmq_sock in socks) and (socks[self.zmq_sock] == zmq.POLLIN):
+                            topic, msg = self.zmq_sock.recv_multipart()
+                            self.zmq_on_recv(topic, msg)
+                finally:
+                    print("Camera finally stopped")
+                    camera.stop_recording()
 
 def main():
+    # TODO: Add support for combining the before and after videos.
+    # TODO: Add support for uploading the video
+    # https://developers.google.com/youtube/v3/code_samples/python#upload_a_video
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--width", "-w", type=int, default=1280,
