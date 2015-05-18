@@ -67,6 +67,7 @@ from apiclient.errors import HttpError
 from apiclient.http import MediaFileUpload
 from oauth2client.client import flow_from_clientsecrets
 from oauth2client.file import Storage
+import oauth2client.tools
 from oauth2client.tools import argparser, run_flow
 
 # Explicitly tell the underlying HTTP transport library not to retry, since
@@ -148,7 +149,7 @@ def initialize_upload(youtube, file, body):
         part=",".join(body.keys()),
         body=body,
         media_body=MediaFileUpload(file, chunksize=-1, resumable=True,
-                                   mimetype="[application/octet-stream]")
+                                   mimetype="application/octet-stream")
     )
 
     resumable_upload(insert_request, max)
@@ -199,32 +200,114 @@ class Struct(object):
         self.__dict__.update(entries)
 
 
-def upload_to_youtube(catcierge_id, args, before_file, after_file, out_file):
+def create_catcierge_description(event):
+    success = event["match_group_success"]
+    direction = event["match_group_direction"]
+
+    if direction.upper() == "IN":
+        prey = "Detected {0}prey".format("no " if success else "")
+    else:
+        prey = "Prey detection skipped when going out"
+
+    if "match_group_succes_count" in event:
+        success_count = event["match_group_succes_count"]
+    else:
+        success_count = len(filter(lambda m: m["success"], event["matches"]))
+
+    if "match_group_start" in event:
+        start = event["match_group_start"]
+    elif "start" in event:
+        start = event["start"]
+    else:
+        start = "unknown"
+
+    if "match_group_end" in event:
+        end = event["match_group_end"]
+    elif "end" in event:
+        end = event["end"]
+    else:
+        end = "unknown"
+
+    d = """
+    {prey}
+
+    {success_count} of {count} matches ok ({needed} ok matches needed to keep open)
+
+    Status: {status}
+    Direction: {direction}
+    In direction: {in_direction}
+    Match start: {match_start}
+    Match end: {match_end}
+    Description: {description}
+
+    Version: {version}
+    git hash: {git_hash}
+    git tainted: {git_tainted}
+    Timezone: {timezone}
+    Time zone offset: {timezone_offset}
+    State: {state}
+    Previous state: {prev_state}
+
+    """.format(status="OK" if success else "FAIL",
+               direction=direction.upper(),
+               in_direction=event["settings"]["haar_matcher"]["in_direction"],
+               description=event["description"],
+               match_start=start,
+               match_end=end,
+               prey=prey,
+               success_count=success_count,
+               count=event["match_group_count"],
+               needed=event["settings"]["ok_matches_needed"],
+               version=event["version"],
+               git_hash=event["git_hash"],
+               git_tainted=event["git_tainted"],
+               timezone=event["timezone"],
+               timezone_offset=event["timezone_utc_offset"],
+               state=event["state"],
+               prev_state=event["prev_state"])
+
+    # TODO: Add individual matches also
+
+    return d
+
+
+def upload_to_youtube(catcierge_id, catcierge_event, args, before_file, after_file, out_file):
     logger.info("Uploading %s to youtube" % catcierge_id)
+
+    if not os.path.exists(before_file):
+        print("Missing: %s" % before_file)
+
+    if not os.path.exists(after_file):
+        print("Missing: %s" % after_file)    
 
     # avconv -i concat:"catcierge-e18fc626841d5201992c5b1c000d37913dbdfc7-01.h264|catcierge-e18fc626841d5201992c5b1c000d37913dbdfc7-02.h264" -c copy catcierge-e18fc626841d5201992c5b1c000d37913dbdfc7.h264
     # https://developers.google.com/youtube/v3/code_samples/python#upload_a_video
     try:
         logger.info("Merge files %s + %s => %s" % (before_file, after_file, out_file))
-        ret = subprocess.check_call(['avconv', '-i', 'concat:"%s|%s"' % (before_file, after_file), '-c', 'copy', out_file])
+        cmd = ['avconv', '-i', 'concat:%s|%s' % (before_file, after_file), '-c', 'copy', out_file]
+        print("Call: %s" % " ".join(cmd))
+        ret = subprocess.check_call(cmd)
     except Exception as ex:
         logger.error("Failed to merge %s with %s. Cannot upload to youtube" % (before_file, after_file))
         return
 
-    body=dict(
+    description = create_catcierge_description(catcierge_event)
+    logger.info("Video description:\n%s" % description)
+
+    body = dict(
         snippet=dict(
             title="Catcierge %s" % time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time())),
-            description="",
+            description=description,
             tags=[catcierge_id, "cat", "cat door"],
             categoryId="22"
         ),
         status=dict(
-            privacyStatus=options.privacyStatus
+            privacyStatus=args.privacy_status
         )
     )
 
     logger.info("Authenticate towards Youtube")
-    youtube = get_authenticated_service(body.snippet)
+    youtube = get_authenticated_service(args)
 
     try:
         logger.info("Initialized Youtube upload")
@@ -233,6 +316,8 @@ def upload_to_youtube(catcierge_id, args, before_file, after_file, out_file):
         logger.info("Youtube upload, an HTTP error %d occurred:\n%s" % (e.resp.status, e.content))
     except Exception as e:
         logger.info("Failed to upload to youtube: %s" % e)
+
+    # TODO: Add push of video ID to database for fast lookup
 
 
 class CatciergeCam(object):
@@ -259,6 +344,22 @@ class CatciergeCam(object):
             logger.info("Connecting ZMQ socket: %s" % connect_str)
             self.zmq_sock.connect(connect_str)
 
+    def simplify_json(self, msg):
+        """
+        Gets rid of unused parts of the catcierge JSON that's there
+        because the catciege template system sucks.
+        """
+        j = json.loads(msg)
+
+        if "matches" in j:
+            j["matches"] = j["matches"][:j["match_group_count"]]
+
+            for m in j["matches"]:
+                if "steps" in m:
+                    m["steps"] = m["steps"][:m["step_count"]]
+
+        return j
+
     def zmq_on_recv(self, req_topic, msg):
         """
         Receives ZMQ subscription messages from Catcierge and
@@ -266,7 +367,8 @@ class CatciergeCam(object):
         """
         if (req_topic == self.args.topic):
             self.cam_triggered = True
-            self.catcierge_id = json.loads(msg)["id"]
+            self.catcierge_event = self.simplify_json(msg)
+            self.catcierge_id = self.catcierge_event["id"]
             logger.info('Catcierge topic [%s], id: %s: Trigger cam'
                     % (req_topic, self.catcierge_id[6:]))
         else:
@@ -295,9 +397,9 @@ class CatciergeCam(object):
         self.cam_triggered = False
         logger.info("  Camera triggered")
 
-        before_file = 'catcierge-%s-01.h264' % (self.catcierge_id)
-        after_file = 'catcierge-%s-02.h264' % (self.catcierge_id)
-        out_file = 'catcierge-%s.h264' % (self.catcierge_id)
+        before_file = os.path.abspath('catcierge-%s-01.h264' % (self.catcierge_id))
+        after_file = os.path.abspath('catcierge-%s-02.h264' % (self.catcierge_id))
+        out_file = os.path.abspath('catcierge-%s.h264' % (self.catcierge_id))
 
         record_start = time.time()
         camera.start_preview()
@@ -323,18 +425,23 @@ class CatciergeCam(object):
             logger.info("  Recording ...")
             camera.wait_recording(1)
 
-        logger.info("  Recording stopped after %ss" % (time.time() - record_start))
         camera.split_recording(stream)
+        logger.info("  Recording stopped after %ss" % (time.time() - record_start))
         camera.stop_preview()
 
         # Upload to youtube.
         if self.args.youtube:
             logger.info("  Youtube upload:")
             p = mp.Process(target=upload_to_youtube,
-                           args=(self.catcierge_id, self.args, before_file, after_file, out_file))
+                           args=(self.catcierge_id,
+                                 self.catcierge_event,
+                                 self.args,
+                                 before_file,
+                                 after_file,
+                                 out_file))
             p.start()
         else:
-            logger.info("  Youtube upload OFF")
+            logger.info("  Youtube upload: OFF")
 
     def run(self):
         logger.info("Starting up...")
@@ -367,33 +474,77 @@ class CatciergeCam(object):
 
 
 def main():
-    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser = argparse.ArgumentParser(description="""
+        Catcierge Camera listens to events sent from a Catcierge cat door
+        detector and triggers the Raspberry Pi Camera to record video.
 
-    parser.add_argument("--width", type=int, default=1280,
+        By writing the video being recorded into a circular buffer continously
+        video showing what happened before the actual trigger point can be
+        included as well.
+
+        The result can then be automatically uploaded to youtube.
+        """,
+        epilog="",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        parents=[oauth2client.tools.argparser])
+
+    zmq_group = parser.add_argument_group("Catcierge ZMQ PUB",
+        "Settings for the ZMQ PUB port that Catcierge publishes events on.")
+    zmq_group.add_argument("--server", "-s",
+        help="Server hostname. This is required.")
+    zmq_group.add_argument("--port", "-p", type=int, default=5556,
+        help="Server port.")
+    zmq_group.add_argument("--transport", "-t", default="tcp",
+        help="Server transport.")
+    zmq_group.add_argument("--topic", default="",
+        help="Topic to listen to.")
+
+    cam_group = parser.add_argument_group("Camera settings",
+        "Settings for the camera, recording durations and the like.")
+    cam_group.add_argument("--width", type=int, default=1280,
         help="Camera resolution width.")
-    parser.add_argument("--height", type=int, default=720,
+    cam_group.add_argument("--height", type=int, default=720,
         help="Camera resolution height.")
-    parser.add_argument("--buffer", "-b", type=int, default=10,
+    cam_group.add_argument("--buffer", type=int, default=10,
         help="""Circular buffer duration in seconds.
                 Time to record before being triggered.""")
-    parser.add_argument("--server", "-s", required=True,
-        help="Catcierge ZMQ publish server hostname.")
-    parser.add_argument("--port", "-p", type=int, default=5556,
-        help="Catcierge ZMQ publish server port.")
-    parser.add_argument("--transport", "-t", default="tcp",
-        help="Catcierge ZMQ publish server transport.")
-    parser.add_argument("--topic", default="",
-        help="Catcierge ZMQ publish topic to listen to.")
-    parser.add_argument("--max_duration", type=int, default=180,
+    cam_group.add_argument("--max_duration", type=int, default=180,
         help="Max duration in seconds to record after triggered.")
-    parser.add_argument("--motion_wait", type=int, default=10,
+    cam_group.add_argument("--motion_wait", type=int, default=10,
         help="The time to wait after detecting motion before checking again.")
-    parser.add_argument("--youtube", action="store_true",
+
+    # TODO: Add output directory.
+
+    youtube_group = parser.add_argument_group("Youtube settings",
+        """
+        To setup youtube authentication you first must run the program
+        with the --youtube_setup flag. Make sure you have a client_secrets.json
+        file in the directory:
+        https://developers.google.com/api-client-library/python/guide/aaa_client_secrets
+        """)
+    youtube_group.add_argument("--youtube", action="store_true",
         help="Upload to youtube.")
+    youtube_group.add_argument("--privacy_status", choices=VALID_PRIVACY_STATUSES,
+        default=VALID_PRIVACY_STATUSES[0], help="Video privacy status.")
+    youtube_group.add_argument("--youtube_setup", action="store_true",
+        help="Setup youtube upload settings.")
 
     args = parser.parse_args()
+
+    if args.youtube_setup:
+        args.noauth_local_webserver = True
+        logger.info("Setup Youtube authentication")
+
+        youtube = get_authenticated_service(args)
+        return 0
+
+    if not args.server:
+        logger.error("You must specify a catcierge publish server")
+        return -1
+
     catcam = CatciergeCam(args)
     
+    # Setup a SIG handler.
     class sighelp:
         sigint_count = 0
 
@@ -412,5 +563,7 @@ def main():
     signal.signal(signal.SIGTERM, sighandler)
 
     catcam.run()
+
+    return 0
 
 if __name__ == '__main__': sys.exit(main())
