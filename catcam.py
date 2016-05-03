@@ -490,7 +490,7 @@ def main():
 
     zmq_group = parser.add_argument_group("Catcierge ZMQ PUB",
         "Settings for the ZMQ PUB port that Catcierge publishes events on.")
-    zmq_group.add_argument("--server", "-s",
+    zmq_group.add_argument("--server", "-s", required=True,
         help="Server hostname. This is required.")
     zmq_group.add_argument("--port", "-p", type=int, default=5556,
         help="Server port.")
